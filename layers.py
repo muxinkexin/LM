@@ -298,3 +298,45 @@ def compute_depth_errors(gt, pred):
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
 
+
+
+def ra_intrinsics(K, meta, height, width):
+    """Pixel-center-correct resize/crop intrinsics (align_corners=False)."""
+    rh, rw, dy, dx = meta.to(K).unbind(1)
+    sx, sy = rw / width, rh / height
+    out = K.clone()
+    out[:, 0, :] = K[:, 0, :] * sx[:, None]
+    out[:, 1, :] = K[:, 1, :] * sy[:, None]
+    out[:, 0, 2] += (sx - 1) / 2 - dx
+    out[:, 1, 2] += (sy - 1) / 2 - dy
+    return out
+
+
+def ra_overlap(mid, view, meta, branch, mid_mask=None):
+    """Yield exact corresponding regions; sigmoid outputs are inverse-depth codes,
+    NOT pixel disparities, so never multiply predictions by the image resize ratio.
+    """
+    h, w = mid.shape[-2:]
+    meta_rows = meta.detach().cpu().tolist()
+    for i, (rh, rw, dy, dx) in enumerate(meta_rows):
+        ref = F.interpolate(mid[i:i+1], (rh, rw), mode="bilinear", align_corners=False)
+        mask = mid.new_ones(1, 1, rh, rw) if mid_mask is None else F.interpolate(
+            mid_mask[i:i+1].float(), (rh, rw), mode="nearest")
+        if branch == "high":
+            ref, mask = ref[:, :, dy:dy+h, dx:dx+w], mask[:, :, dy:dy+h, dx:dx+w]
+            pred = view[i:i+1]
+        else:
+            pred = view[i:i+1, :, :rh, :rw]
+        # Ignore image/crop borders and require the complete SSIM support to be valid.
+        mask = 1 - F.max_pool2d(1 - F.pad(mask, (1, 1, 1, 1)), 3, 1)
+        yield ref, pred, mask.detach()
+
+
+def ra_consistency_loss(mid, view, meta, branch, ssim=None, mid_mask=None):
+    loss = mid.new_zeros(())
+    for ref, pred, mask in ra_overlap(mid, view, meta, branch, mid_mask):
+        error = (ref - pred).abs()
+        if ssim is not None:
+            error = 0.85 * ssim(ref, pred) + 0.15 * error
+        loss = loss + (error * mask).sum() / mask.sum().clamp_min(1)
+    return loss / mid.shape[0]

@@ -10,6 +10,9 @@ from options import LiteMonoOptions
 import datasets
 import networks
 import time
+import json
+import hashlib
+import torch.nn.functional as F
 from thop import clever_format
 from thop import profile
 
@@ -74,11 +77,15 @@ def batch_post_process_disparity(l_disp, r_disp):
 def evaluate(opt):
     """Evaluates a pretrained model using a specified test set
     """
+    torch.backends.cuda.matmul.allow_tf32 = opt.allow_tf32
+    torch.backends.cudnn.allow_tf32 = opt.allow_tf32
     MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
 
     if opt.ext_disp_to_eval is None:
 
+        if not opt.load_weights_folder:
+            raise ValueError("--load_weights_folder is required")
         opt.load_weights_folder = os.path.expanduser(opt.load_weights_folder)
 
         assert os.path.isdir(opt.load_weights_folder), \
@@ -93,45 +100,65 @@ def evaluate(opt):
         encoder_dict = torch.load(encoder_path, map_location='cpu', weights_only=True)
         decoder_dict = torch.load(decoder_path, map_location='cpu', weights_only=True)
 
-        dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
-                                           encoder_dict['height'], encoder_dict['width'],
-                                           [0], 4, is_train=False)
-        dataloader = DataLoader(dataset, 16, shuffle=False, num_workers=opt.num_workers,
-                                pin_memory=True, drop_last=False)
-
-        encoder = networks.LiteMono(model=opt.model,
-                                    height=encoder_dict['height'],
-                                    width=encoder_dict['width'])
-        depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(3))
+        feed_h = opt.eval_height or encoder_dict['height']
+        feed_w = opt.eval_width or encoder_dict['width']
+        dataset = datasets.KITTIRAWDataset(opt.data_path, filenames, feed_h, feed_w,
+                                           [0], 4, is_train=False,
+                                           img_ext='.png' if opt.png else '.jpg')
+        # Metrics use the bundled GT; do not recompute optional online LiDAR depth.
+        dataset.load_depth = False
+        dataloader = DataLoader(dataset, opt.eval_batch_size, shuffle=False,
+                                num_workers=opt.num_workers, pin_memory=not opt.no_cuda,
+                                drop_last=False)
+        device = torch.device('cpu' if opt.no_cuda else 'cuda')
+        # Dilation is architecture metadata: always construct with TRAINING size.
+        encoder = networks.LiteMono(model=encoder_dict.get('model', opt.model),
+                                    height=encoder_dict['height'], width=encoder_dict['width'])
+        # Legacy checkpoints have one dispconv per decoder index >=6.
+        heads = sorted({int(k.split('.')[1]) - 6 for k in decoder_dict
+                        if k.startswith('decoder.') and k.endswith('.conv.weight')
+                        and int(k.split('.')[1]) >= 6})
+        scales = encoder_dict.get('scales', heads)
+        if not scales or 0 not in scales:
+            raise ValueError("checkpoint does not have a scale-0 depth head")
+        depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=scales)
         model_dict = encoder.state_dict()
-        depth_model_dict = depth_decoder.state_dict()
-        encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
-        depth_decoder.load_state_dict({k: v for k, v in decoder_dict.items() if k in depth_model_dict})
-
-        encoder.cuda()
-        encoder.eval()
-        depth_decoder.cuda()
-        depth_decoder.eval()
+        encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict}, strict=True)
+        depth_decoder.load_state_dict(decoder_dict, strict=True)
+        encoder.to(device).eval()
+        depth_decoder.to(device).eval()
+        profiled = False
+        profile_info = None
+        num_images, elapsed = 0, 0.0
 
         pred_disps = []
 
         print("-> Computing predictions with size {}x{}".format(
-            encoder_dict['width'], encoder_dict['height']))
+            feed_w, feed_h))
 
         with torch.no_grad():
             for data in dataloader:
-                input_color = data[("color", 0, 0)].cuda()
+                input_color = data[("color", 0, 0)].to(device)
+                # Any requested size >=64: only pad the right/bottom to encoder stride.
+                input_color = F.pad(input_color, (0, (-feed_w) % 32, 0, (-feed_h) % 32), mode='replicate')
 
                 if opt.post_process:
                     # Post-processed results require each image to have two forward passes
                     input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
 
-                flops, params, flops_e, params_e, flops_d, params_d = profile_once(encoder, depth_decoder, input_color)
+                if opt.profile and not profiled:
+                    profile_info = profile_once(encoder, depth_decoder, input_color)
+                    profiled = True
                 t1 = time_sync()
                 output = depth_decoder(encoder(input_color))
                 t2 = time_sync()
 
-                pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
+                elapsed += t2 - t1
+                num_images += data[("color", 0, 0)].shape[0]
+                pred_disp, _ = disp_to_depth(output[("disp", 0)][:, :, :feed_h, :feed_w],
+                                             opt.min_depth, opt.max_depth)
+                if not torch.isfinite(pred_disp).all():
+                    raise FloatingPointError("non-finite inverse-depth prediction")
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
 
                 if opt.post_process:
@@ -147,15 +174,17 @@ def evaluate(opt):
         print("-> Loading predictions from {}".format(opt.ext_disp_to_eval))
         pred_disps = np.load(opt.ext_disp_to_eval)
 
-        if opt.eval_eigen_to_benchmark:
+        if getattr(opt, 'eval_eigen_to_benchmark', False):
             eigen_to_benchmark_ids = np.load(
                 os.path.join(splits_dir, "benchmark", "eigen_to_benchmark_ids.npy"))
 
             pred_disps = pred_disps[eigen_to_benchmark_ids]
 
     if opt.save_pred_disps:
-        output_path = os.path.join(
-            opt.load_weights_folder, "disps_{}_split.npy".format(opt.eval_split))
+        out_dir = opt.eval_out_dir or opt.load_weights_folder or '.'
+        os.makedirs(out_dir, exist_ok=True)
+        suffix = "{}x{}".format(feed_h, feed_w) if opt.ext_disp_to_eval is None else 'external'
+        output_path = os.path.join(out_dir, "disps_{}_{}.npy".format(opt.eval_split, suffix))
         print("-> Saving predicted disparities to ", output_path)
         np.save(output_path, pred_disps)
 
@@ -167,8 +196,10 @@ def evaluate(opt):
     gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)["data"]
 
     print("-> Evaluating")
-    print("   Mono evaluation - using median scaling")
+    print("   Mono evaluation - median scaling: {}".format(not opt.disable_median_scaling))
 
+    if len(gt_depths) != len(pred_disps):
+        raise ValueError("GT/prediction count mismatch: {} vs {}".format(len(gt_depths), len(pred_disps)))
     errors = []
     ratios = []
 
@@ -214,10 +245,68 @@ def evaluate(opt):
 
     print("\n  " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
     print(("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
-    print("\n  " + ("flops: {0}, params: {1}, flops_e: {2}, params_e:{3}, flops_d:{4}, params_d:{5}").format(flops, params, flops_e, params_e, flops_d, params_d))
+    if opt.ext_disp_to_eval is None:
+        print("Measured forward throughput (no loader/profile): {:.2f} images/s".format(num_images / max(elapsed, 1e-9)))
+        if profile_info is not None:
+            print("THOP estimates (MACs, params; unsupported ops excluded):", profile_info)
+    if opt.metrics_json:
+        result = {
+            "metrics": dict(zip(["abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"], mean_errors.tolist())),
+            "per_image_errors": np.asarray(errors).tolist(),
+            "input_hw": [feed_h, feed_w] if opt.ext_disp_to_eval is None else None,
+            "weights": opt.load_weights_folder, "post_process": opt.post_process,
+            "median_scaling": not opt.disable_median_scaling,
+            "depth_scale_factor": opt.pred_depth_scale_factor,
+            "split": opt.eval_split, "num_images": len(errors),
+            "test_files_sha256": hashlib.sha256('\n'.join(readlines(os.path.join(
+                splits_dir, opt.eval_split, 'test_files.txt'))).encode()).hexdigest()}
+        os.makedirs(os.path.dirname(os.path.abspath(opt.metrics_json)), exist_ok=True)
+        with open(opt.metrics_json, 'w') as f:
+            json.dump(result, f, indent=2)
     print("\n-> Done!")
+
+
+def compare_metrics(directories):
+    """Paired image-bootstrap intervals; use multiple training seeds for conclusions."""
+    from pathlib import Path
+    base_dir, ra_dir = map(Path, directories)
+    left = {p.name: p for p in base_dir.glob('*.json')}
+    right = {p.name: p for p in ra_dir.glob('*.json')}
+    if set(left) != set(right) or not left:
+        raise ValueError("directories must contain the same nonempty set of metric JSON filenames")
+    print("Input HxW | Baseline AbsRel | RA AbsRel | RA-Base (95% image bootstrap CI) | Delta a1")
+    rows = []
+    rng = np.random.default_rng(42)
+    for name in sorted(left):
+        with open(left[name]) as f: b = json.load(f)
+        with open(right[name]) as f: r = json.load(f)
+        for key in ['input_hw', 'split', 'num_images', 'post_process', 'median_scaling',
+                    'depth_scale_factor', 'test_files_sha256']:
+            if key not in b or b[key] != r.get(key):
+                raise ValueError("protocol mismatch or missing {} in {}".format(key, name))
+        be, re = np.asarray(b['per_image_errors']), np.asarray(r['per_image_errors'])
+        if be.shape != re.shape or be.shape != (b['num_images'], 7):
+            raise ValueError("invalid paired error arrays")
+        if not np.isfinite(be).all() or not np.isfinite(re).all():
+            raise ValueError("metric arrays contain NaN/Inf")
+        delta = re[:, 0] - be[:, 0]
+        boot = np.asarray([delta[rng.integers(0, len(delta), len(delta))].mean() for _ in range(5000)])
+        lo, hi = np.percentile(boot, [2.5, 97.5])
+        hw = b['input_hw']
+        print("{} | {:.5f} | {:.5f} | {:+.5f} [{:+.5f}, {:+.5f}] | {:+.5f}".format(
+            hw, be[:, 0].mean(), re[:, 0].mean(), delta.mean(), lo, hi,
+            (re[:, 4] - be[:, 4]).mean()))
+        rows.append((hw, be[:, 0].mean(), re[:, 0].mean(), delta.mean()))
+    print("Negative AbsRel delta is better. Image-bootstrap ignores correlation across nearby frames;")
+    print("it does not replace repeated training seeds or prove resolution adaptation by itself.")
+    print("Check off-training resolutions, in-resolution regression, and model selection on held-out val.")
+    return rows
 
 
 if __name__ == "__main__":
     options = LiteMonoOptions()
-    evaluate(options.parse())
+    opt = options.parse()
+    if opt.compare_metrics:
+        compare_metrics(opt.compare_metrics)
+    else:
+        evaluate(opt)

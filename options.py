@@ -18,7 +18,7 @@ class LiteMonoOptions:
         self.parser.add_argument("--log_dir",
                                  type=str,
                                  help="log directory",
-                                 default="/home/tzq/tzq/3/checkpoint")
+                                 default="/home/tzq/tzq/3/checkpoint/LM_runs")
 
         # TRAINING options
         self.parser.add_argument("--model_name",
@@ -91,9 +91,9 @@ class LiteMonoOptions:
                                  default=[0, -1, 1])
 
         self.parser.add_argument("--profile",
-                                 type=bool,
-                                 help="profile once at the beginning of the training",
-                                 default=True)
+                                 action=argparse.BooleanOptionalAction,
+                                 help="profile a single evaluation batch with THOP",
+                                 default=False)
 
         # OPTIMIZATION options
         self.parser.add_argument("--batch_size",
@@ -212,6 +212,61 @@ class LiteMonoOptions:
                                       "from the original monodepth paper",
                                  action="store_true")
 
+        # RA-Depth training mechanisms; no inference-time modules.
+        self.parser.add_argument("--ra_depth", action="store_true")
+        self.parser.add_argument("--ra_views", choices=["both", "high", "low"], default="both")
+        self.parser.add_argument("--ra_high_range", nargs=2, type=float, default=[1.1, 2.0])
+        self.parser.add_argument("--ra_low_range", nargs=2, type=float, default=[0.7, 0.9])
+        self.parser.add_argument("--ra_consistency_weight", type=float, default=0.1)
+        self.parser.add_argument("--ra_photo_weight", type=float, default=1.0)
+        self.parser.add_argument("--ra_warmup_epochs", type=int, default=5)
+        self.parser.add_argument("--seed", type=int, default=42)
+        self.parser.add_argument("--max_train_steps", type=int, default=0,
+                                 help="0: full training; positive: smoke run with checkpoint")
+        self.parser.add_argument("--self_test", action="store_true",
+                                 help="synthetic mechanism/gradient tests; no KITTI required")
+        self.parser.add_argument("--check_data", action="store_true",
+                                 help="check all split image paths, then exit")
+        self.parser.add_argument("--eval_height", type=int, default=None)
+        self.parser.add_argument("--eval_width", type=int, default=None)
+        self.parser.add_argument("--eval_batch_size", type=int, default=4)
+        self.parser.add_argument("--metrics_json", type=str, default=None)
+        self.parser.add_argument("--compare_metrics", nargs=2, metavar=("BASE_DIR", "RA_DIR"),
+                                 help="compare paired per-resolution evaluation JSON files")
+        self.parser.add_argument("--allow_tf32", action="store_true")
+
     def parse(self):
         self.options = self.parser.parse_args()
+        o = self.options
+        if o.height < 64 or o.width < 64 or o.height % 32 or o.width % 32:
+            self.parser.error("training height/width must be >=64 and multiples of 32")
+        if (o.eval_height is None) != (o.eval_width is None):
+            self.parser.error("set both --eval_height and --eval_width")
+        if o.eval_height is not None and min(o.eval_height, o.eval_width) < 64:
+            self.parser.error("evaluation dimensions must be >=64")
+        if len(o.lr) != 6 or min(o.lr[2], o.lr[5]) < 1:
+            self.parser.error("--lr requires six numbers; cycle lengths must be positive")
+        if not o.scales or 0 not in o.scales or any(v not in [0, 1, 2] for v in o.scales):
+            self.parser.error("--scales must contain 0 and be a subset of 0 1 2")
+        if min(o.batch_size, o.eval_batch_size, o.num_epochs, o.log_frequency, o.save_frequency) < 1:
+            self.parser.error("batch sizes, epochs and logging/save intervals must be positive")
+        if o.num_workers < 0 or o.max_train_steps < 0:
+            self.parser.error("workers and max_train_steps must be nonnegative")
+        if o.load_weights_folder and o.mypretrain:
+            self.parser.error("choose load_weights_folder fine-tuning OR mypretrain initialization")
+        if len(o.scales) != len(set(o.scales)):
+            self.parser.error("duplicate scales are not supported")
+        if o.ra_depth:
+            if o.scales != [0] or o.v1_multiscale or o.predictive_mask:
+                self.parser.error("RA migration requires --scales 0, without v1_multiscale/predictive_mask")
+            if o.use_stereo or o.pose_model_type != "separate_resnet" or o.pose_model_input != "pairs":
+                self.parser.error("RA migration supports monocular separate_resnet/pairs only")
+            if len(o.frame_ids) < 2 or o.frame_ids[0] != 0:
+                self.parser.error("RA requires target frame 0 and temporal source frames")
+        if not 1 <= o.ra_high_range[0] <= o.ra_high_range[1] <= 3:
+            self.parser.error("high range must satisfy 1 <= min <= max <= 3")
+        if not 0.5 <= o.ra_low_range[0] <= o.ra_low_range[1] <= 1:
+            self.parser.error("low range must satisfy .5 <= min <= max <= 1")
+        if min(o.ra_photo_weight, o.ra_consistency_weight, o.ra_warmup_epochs) < 0:
+            self.parser.error("RA weights and warmup must be nonnegative")
         return self.options

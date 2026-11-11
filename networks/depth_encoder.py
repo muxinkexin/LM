@@ -338,6 +338,11 @@ class LiteMono(nn.Module):
             elif height == 320 and width == 1024:
                 self.dilation = [[1, 2, 3], [1, 2, 3], [1, 2, 3, 1, 2, 3, 2, 4, 6]]
 
+        if not hasattr(self, "dilation"):
+            # New training sizes use the low-resolution dilation preset.
+            tail = [1, 2, 3, 1, 2, 3, 2, 4, 6] if self.depth[2] == 10 else [1, 2, 3, 2, 4, 6]
+            self.dilation = [[1, 2, 3], [1, 2, 3], tail]
+
         for g in global_block_type:
             assert g in ['None', 'LGFI']
 

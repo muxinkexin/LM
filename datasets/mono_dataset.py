@@ -38,9 +38,10 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
-                 img_ext='.jpg'):
+                 img_ext='.jpg', ra_options=None):
         super(MonoDataset, self).__init__()
 
+        self.ra_options = ra_options
         self.data_path = data_path
         self.filenames = filenames
         self.height = height
@@ -88,17 +89,41 @@ class MonoDataset(data.Dataset):
         """
         for k in list(inputs):
             frame = inputs[k]
-            if "color" in k:
+            if isinstance(k, tuple) and k[0] == "color":
                 n, im, i = k
                 for i in range(self.num_scales):
                     inputs[(n, im, i)] = self.resize[i](inputs[(n, im, i - 1)])
 
         for k in list(inputs):
             f = inputs[k]
-            if "color" in k:
+            if isinstance(k, tuple) and k[0] == "color":
                 n, im, i = k
                 inputs[(n, im, i)] = self.to_tensor(f)
                 inputs[(n + "_aug", im, i)] = self.to_tensor(color_aug(f))
+
+    def make_ra_views(self, inputs, color_aug):
+        o = self.ra_options
+        for branch in (["high", "low"] if o.ra_views == "both" else [o.ra_views]):
+            ratio = random.uniform(*(o.ra_high_range if branch == "high" else o.ra_low_range))
+            rh, rw = int(self.height * ratio), int(self.width * ratio)
+            dx = random.randint(0, rw - self.width) if branch == "high" else 0
+            dy = random.randint(0, rh - self.height) if branch == "high" else 0
+            inputs[("ra_meta", branch)] = torch.tensor([rh, rw, dy, dx], dtype=torch.long)
+            for frame_id in self.frame_idxs:
+                im = inputs[("color", frame_id, -1)].resize((rw, rh), self.interp)
+                if branch == "high":
+                    im = im.crop((dx, dy, dx + self.width, dy + self.height))
+                else:
+                    # Official RA-Depth's overlap stitching, preserving the top-left real view.
+                    tile = im
+                    im = Image.new("RGB", (self.width, self.height))
+                    im.paste(tile, (0, 0))
+                    im.paste(tile.crop((0, 2*rh-self.height, rw, rh)), (0, rh))
+                    im.paste(tile.crop((2*rw-self.width, 0, rw, rh)), (rw, 0))
+                    im.paste(tile.crop((2*rw-self.width, 2*rh-self.height, rw, rh)), (rw, rh))
+                inputs[("ra_color", branch, frame_id)] = self.to_tensor(im)
+                if frame_id == 0:
+                    inputs[("ra_aug", branch, frame_id)] = self.to_tensor(color_aug(im))
 
     def __len__(self):
         return len(self.filenames)
@@ -167,11 +192,21 @@ class MonoDataset(data.Dataset):
         if do_color_aug:
             # color_aug = transforms.ColorJitter.get_params(
             #     self.brightness, self.contrast, self.saturation, self.hue)
-            color_aug = transforms.ColorJitter(
+            from torchvision.transforms import functional as TF
+            order, b, c, sat, hue = transforms.ColorJitter.get_params(
                 self.brightness, self.contrast, self.saturation, self.hue)
+            def color_aug(image):
+                for fn in order:
+                    if fn == 0 and b is not None: image = TF.adjust_brightness(image, b)
+                    if fn == 1 and c is not None: image = TF.adjust_contrast(image, c)
+                    if fn == 2 and sat is not None: image = TF.adjust_saturation(image, sat)
+                    if fn == 3 and hue is not None: image = TF.adjust_hue(image, hue)
+                return image
         else:
             color_aug = (lambda x: x)
 
+        if self.is_train and self.ra_options is not None:
+            self.make_ra_views(inputs, color_aug)
         self.preprocess(inputs, color_aug)
 
         for i in self.frame_idxs:

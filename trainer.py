@@ -15,7 +15,9 @@ from checkpoint_utils import load_pretraining_checkpoint
 
 import datasets
 import networks
-from linear_warmup_cosine_annealing_warm_restarts_weight_decay import ChainedScheduler
+import random
+import numpy as np
+import os
 
 
 # torch.backends.cudnn.benchmark = True
@@ -111,26 +113,13 @@ class Trainer:
         if self.use_pose_net:
             self.model_pose_optimizer = optim.AdamW(self.parameters_to_train_pose, self.opt.lr[3], weight_decay=self.opt.weight_decay)
 
-        self.model_lr_scheduler = ChainedScheduler(
-                            self.model_optimizer,
-                            T_0=int(self.opt.lr[2]),
-                            T_mul=1,
-                            eta_min=self.opt.lr[1],
-                            last_epoch=-1,
-                            max_lr=self.opt.lr[0],
-                            warmup_steps=0,
-                            gamma=0.9
-                        )
-        self.model_pose_lr_scheduler = ChainedScheduler(
-            self.model_pose_optimizer,
-            T_0=int(self.opt.lr[5]),
-            T_mul=1,
-            eta_min=self.opt.lr[4],
-            last_epoch=-1,
-            max_lr=self.opt.lr[3],
-            warmup_steps=0,
-            gamma=0.9
-        )
+        # The repository did not include its imported third-party scheduler.
+        # Native cosine schedule, common to baseline and RA for a controlled comparison.
+        self.model_lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.model_optimizer, T_max=int(self.opt.lr[2]), eta_min=self.opt.lr[1])
+        if self.use_pose_net:
+            self.model_pose_lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.model_pose_optimizer, T_max=int(self.opt.lr[5]), eta_min=self.opt.lr[4])
 
         if self.opt.load_weights_folder is not None:
             self.load_model()
@@ -158,18 +147,25 @@ class Trainer:
 
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
-            self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+            self.opt.frame_ids, 4, is_train=True, img_ext=img_ext,
+            ra_options=self.opt if self.opt.ra_depth else None)
+        train_dataset.load_depth = False  # Self-supervision needs RGB only.
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            num_workers=self.opt.num_workers, pin_memory=not self.opt.no_cuda, drop_last=True,
+            generator=torch.Generator().manual_seed(self.opt.seed))
         val_dataset = self.dataset(
             self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=False, img_ext=img_ext)
+        val_dataset.load_depth = False  # Full metrics use evaluate_depth.py and bundled GT.
         self.val_loader = DataLoader(
-            val_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            val_dataset, self.opt.batch_size, False,
+            num_workers=self.opt.num_workers, pin_memory=not self.opt.no_cuda, drop_last=True,
+            generator=torch.Generator().manual_seed(self.opt.seed + 1))
         self.val_iter = iter(self.val_loader)
 
+        if len(self.train_loader) == 0 or len(self.val_loader) == 0:
+            raise ValueError("batch_size exceeds available train/validation samples")
         self.writers = {}
         for mode in ["train", "val"]:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
@@ -202,13 +198,13 @@ class Trainer:
     def set_train(self):
         """Convert all models to training mode
         """
-        for m in self.models.values():
+        for m in list(self.models.values()) + list(self.models_pose.values()):
             m.train()
 
     def set_eval(self):
         """Convert all models to testing/evaluation mode
         """
-        for m in self.models.values():
+        for m in list(self.models.values()) + list(self.models_pose.values()):
             m.eval()
 
     def train(self):
@@ -221,6 +217,14 @@ class Trainer:
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
+            self.model_lr_scheduler.step()
+            if self.use_pose_net:
+                self.model_pose_lr_scheduler.step()
+            if self.opt.max_train_steps and self.step >= self.opt.max_train_steps:
+                self.save_model()
+                break
+        for writer in self.writers.values():
+            writer.close()
 
     def run_epoch(self):
         """Run a single epoch of training and validation
@@ -228,10 +232,6 @@ class Trainer:
 
         print("Training")
         self.set_train()
-
-        self.model_lr_scheduler.step()
-        if self.use_pose_net:
-            self.model_pose_lr_scheduler.step()
 
         for batch_idx, inputs in enumerate(self.train_loader):
 
@@ -242,6 +242,8 @@ class Trainer:
             self.model_optimizer.zero_grad()
             if self.use_pose_net:
                 self.model_pose_optimizer.zero_grad()
+            if not torch.isfinite(losses["loss"]):
+                raise FloatingPointError("non-finite total loss")
             losses["loss"].backward()
             self.model_optimizer.step()
             if self.use_pose_net:
@@ -263,6 +265,8 @@ class Trainer:
                 self.val()
 
             self.step += 1
+            if self.opt.max_train_steps and self.step >= self.opt.max_train_steps:
+                break
 
     def process_batch(self, inputs):
         """Pass a minibatch through the network and generate images and losses
@@ -298,7 +302,88 @@ class Trainer:
         self.generate_images_pred(inputs, outputs)
         losses = self.compute_losses(inputs, outputs)
 
+        if self.opt.ra_depth and self.models["encoder"].training:
+            self.add_ra_losses(inputs, outputs, losses)
         return outputs, losses
+
+    def add_ra_losses(self, inputs, outputs, losses):
+        branches = ["high", "low"] if self.opt.ra_views == "both" else [self.opt.ra_views]
+        photo, consistency = [], []
+        mid_mask = outputs.get("identity_selection/0")
+        if mid_mask is not None:
+            mid_mask = mid_mask.unsqueeze(1)
+        for branch in branches:
+            aux = self.models["depth"](self.models["encoder"](inputs[("ra_aug", branch, 0)]))
+            disp = aux[("disp", 0)]
+            lp = self.ra_photometric(inputs, outputs, disp, branch)
+            lc = ra_consistency_loss(outputs[("disp", 0)], disp,
+                                     inputs[("ra_meta", branch)], branch,
+                                     None if self.opt.no_ssim else self.ssim, mid_mask)
+            losses["ra/photo_" + branch] = lp
+            losses["ra/consistency_" + branch] = lc
+            photo.append(lp)
+            consistency.append(lc)
+        ramp = 1.0 if self.opt.ra_warmup_epochs == 0 else min(
+            1.0, (self.epoch + 1) / self.opt.ra_warmup_epochs)
+        losses["ra/weight"] = outputs[("disp", 0)].new_tensor(
+            self.opt.ra_consistency_weight * ramp)
+        losses["loss_base"] = losses["loss"]
+        losses["loss"] = (losses["loss"] + self.opt.ra_photo_weight * sum(photo) / len(photo)
+                          + losses["ra/weight"] * sum(consistency) / len(consistency))
+
+    def ra_photometric(self, inputs, outputs, disp, branch):
+        """Share physical poses across views; transform K and mask stitched context.
+        The low-view duplicated region supplies context only, never geometry supervision.
+        """
+        h, w = disp.shape[-2:]
+        meta = inputs[("ra_meta", branch)]
+        K = ra_intrinsics(inputs[("K", 0)], meta, h, w)
+        _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
+        points = self.backproject_depth[0](depth, torch.linalg.inv(K))
+        target = inputs[("ra_color", branch, 0)]
+        yy, xx = torch.meshgrid(torch.arange(h, device=disp.device),
+                                torch.arange(w, device=disp.device), indexing="ij")
+        rh = meta[:, 0, None, None] if branch == "low" else h
+        rw = meta[:, 1, None, None] if branch == "low" else w
+        target_valid = ((xx[None] >= 1) & (yy[None] >= 1)
+                        & (xx[None] < rw - 1) & (yy[None] < rh - 1))
+        reprojections, identities, valid_sources = [], [], []
+        for frame_id in self.opt.frame_ids[1:]:
+            T = outputs[("cam_T_cam", 0, frame_id)]
+            grid = self.project_3d[0](points, K, T)
+            px = (grid[..., 0] + 1) * (w - 1) / 2
+            py = (grid[..., 1] + 1) * (h - 1) / 2
+            front = (T @ points)[:, 2].reshape(-1, h, w) > 1e-7
+            valid = (target_valid & front & (px >= 1) & (py >= 1)
+                     & (px < rw - 1) & (py < rh - 1)).unsqueeze(1)
+            # Require valid 3x3 support for the photometric SSIM window.
+            valid = (1 - F.max_pool2d(1 - valid.float(), 3, 1, 1)) > 0.5
+            source = inputs[("ra_color", branch, frame_id)]
+            warped = F.grid_sample(source, grid, padding_mode="border", align_corners=True)
+            reprojections.append(self.compute_reprojection_loss(warped, target).masked_fill(~valid, 1e3))
+            identities.append(self.compute_reprojection_loss(source, target))
+            valid_sources.append(valid)
+        reproj = torch.cat(reprojections, 1)
+        valid = torch.cat(valid_sources, 1)
+        any_valid = valid.any(1, keepdim=True)
+        if self.opt.avg_reprojection:
+            reproj = (reproj.masked_fill(~valid, 0).sum(1, keepdim=True)
+                      / valid.sum(1, keepdim=True).clamp_min(1))
+        best = reproj.min(1, keepdim=True).values
+        if not self.opt.disable_automasking:
+            identity = torch.cat(identities, 1)
+            if self.opt.avg_reprojection:
+                identity = identity.mean(1, keepdim=True)
+            best_identity = (identity + torch.randn_like(identity) * 1e-5).min(1, keepdim=True).values
+            best = torch.minimum(best, best_identity)
+        photo = best.masked_fill(~any_valid, 0).sum() / any_valid.sum().clamp_min(1)
+        smooth = disp.new_zeros(())
+        meta_rows = meta.detach().cpu().tolist()
+        for i in range(disp.shape[0]):
+            ih, iw = meta_rows[i][:2] if branch == "low" else [h, w]
+            d = disp[i:i+1, :, :ih, :iw]
+            smooth = smooth + get_smooth_loss(d / (d.mean() + 1e-7), target[i:i+1, :, :ih, :iw])
+        return photo + self.opt.disparity_smoothness * smooth / disp.shape[0]
 
     def predict_poses(self, inputs, features):
         """Predict poses between input frames for monocular sequences.
@@ -342,7 +427,7 @@ class Trainer:
                     [inputs[("color_aug", i, 0)] for i in self.opt.frame_ids if i != "s"], 1)
 
                 if self.opt.pose_model_type == "separate_resnet":
-                    pose_inputs = [self.models["pose_encoder"](pose_inputs)]
+                    pose_inputs = [self.models_pose["pose_encoder"](pose_inputs)]
 
             elif self.opt.pose_model_type == "shared":
                 pose_inputs = [features[i] for i in self.opt.frame_ids if i != "s"]
@@ -497,7 +582,7 @@ class Trainer:
                 reprojection_losses *= mask
 
                 # add a loss pushing mask to 1 (using nn.BCELoss for stability)
-                weighting_loss = 0.2 * nn.BCELoss()(mask, torch.ones(mask.shape).cuda())
+                weighting_loss = 0.2 * nn.BCELoss()(mask, torch.ones_like(mask))
                 loss += weighting_loss.mean()
 
             if self.opt.avg_reprojection:
@@ -577,7 +662,7 @@ class Trainer:
         print_string = "epoch {:>3} | lr {:.6f} |lr_p {:.6f} | batch {:>6} | examples/s: {:5.1f}" + \
             " | loss: {:.5f} | time elapsed: {} | time left: {}"
         print(print_string.format(self.epoch, self.model_optimizer.state_dict()['param_groups'][0]['lr'],
-                                  self.model_pose_optimizer.state_dict()['param_groups'][0]['lr'],
+                                  self.model_pose_optimizer.state_dict()['param_groups'][0]['lr'] if self.use_pose_net else 0.,
                                   batch_idx, samples_per_sec, loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
@@ -641,6 +726,9 @@ class Trainer:
                 to_save['height'] = self.opt.height
                 to_save['width'] = self.opt.width
                 to_save['use_stereo'] = self.opt.use_stereo
+                to_save['model'] = self.opt.model
+                to_save['scales'] = self.opt.scales
+                to_save['ra_depth'] = self.opt.ra_depth
             torch.save(to_save, save_path)
 
         for model_name, model in self.models_pose.items():
@@ -661,6 +749,11 @@ class Trainer:
         model_dict = self.models["encoder"].state_dict()
         pretrained_dict = load_pretraining_checkpoint(path)['model']
         pretrained_dict = {k: v for k, v in pretrained_dict.items() if (k in model_dict and not k.startswith('norm'))}
+        if not pretrained_dict:
+            raise ValueError("no matching encoder keys in ImageNet checkpoint")
+        if any(v.shape != model_dict[k].shape for k, v in pretrained_dict.items()):
+            raise ValueError("ImageNet checkpoint architecture does not match --model")
+        print("ImageNet encoder tensors matched: {} / {}".format(len(pretrained_dict), len(model_dict)))
         model_dict.update(pretrained_dict)
         self.models["encoder"].load_state_dict(model_dict)
         print('mypretrain loaded.')
@@ -676,31 +769,167 @@ class Trainer:
 
         for n in self.opt.models_to_load:
             print("Loading {} weights...".format(n))
-            path = os.path.join(self.opt.load_weights_folder, "{}.pth".format(n))
+            model = self.models_pose[n] if n in self.models_pose else self.models[n]
+            model_dict = model.state_dict()
+            pretrained_dict = torch.load(os.path.join(self.opt.load_weights_folder, n + '.pth'),
+                                         map_location='cpu', weights_only=True)
+            model.load_state_dict({k: v for k, v in pretrained_dict.items() if k in model_dict}, strict=True)
 
-            if n in ['pose_encoder', 'pose']:
-                model_dict = self.models_pose[n].state_dict()
-                pretrained_dict = torch.load(path, map_location='cpu', weights_only=True)
-                pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-                model_dict.update(pretrained_dict)
-                self.models_pose[n].load_state_dict(model_dict)
-            else:
-                model_dict = self.models[n].state_dict()
-                pretrained_dict = torch.load(path, map_location='cpu', weights_only=True)
-                pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-                model_dict.update(pretrained_dict)
-                self.models[n].load_state_dict(model_dict)
+        print("Loaded model weights; optimizer, epoch and scheduler start fresh (fine-tuning).")
 
-        # loading adam state
 
-        optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
-        optimizer_pose_load_path = os.path.join(self.opt.load_weights_folder, "adam_pose.pth")
-        if os.path.isfile(optimizer_load_path):
-            print("Loading Adam weights")
-            optimizer_dict = torch.load(optimizer_load_path, map_location='cpu', weights_only=True)
-            optimizer_pose_dict = torch.load(optimizer_pose_load_path, map_location='cpu', weights_only=True)
-            self.model_optimizer.load_state_dict(optimizer_dict)
-            self.model_pose_optimizer.load_state_dict(optimizer_pose_dict)
-        else:
-            print("Cannot find Adam weights so Adam is randomly initialized")
+def check_data(opt):
+    """Check all required RGB paths, without starting training or loading weights."""
+    from pathlib import Path
+    root = Path(opt.data_path)
+    ext = '.png' if opt.png else '.jpg'
+    missing, checked = [], 0
+    for split, name, frames in [(opt.split, 'train', opt.frame_ids),
+                                 (opt.split, 'val', opt.frame_ids),
+                                 ('eigen', 'test', [0])]:
+        lines = readlines(str(Path(__file__).parent / 'splits' / split / (name + '_files.txt')))
+        for line in lines:
+            folder, frame, side = line.split()
+            for offset in frames:
+                camera = {'l': 2, 'r': 3, '2': 2, '3': 3}[side]
+                path = root / folder / ('image_0{}/data'.format(camera)) / ('{:010d}{}'.format(int(frame)+offset, ext))
+                checked += 1
+                if not path.is_file():
+                    if len(missing) < 20:
+                        missing.append(str(path))
+    if missing:
+        raise FileNotFoundError("Missing RGB files (first 20):\n" + '\n'.join(missing))
+    gt_file = Path(__file__).parent / 'splits/eigen/gt_depths.npz'
+    with np.load(gt_file, allow_pickle=True, encoding='latin1') as data:
+        count = len(data['data'])
+    expected = len(readlines(str(Path(__file__).parent / 'splits/eigen/test_files.txt')))
+    if count != expected:
+        raise ValueError("Bundled GT count does not match test split")
+    print("PASS data paths: {} references; bundled GT: {} images".format(checked, count))
 
+
+def self_test(opt):
+    """Synthetic geometry, gradients, on/off isolation and variable-resolution tests.
+    No KITTI or pretrained downloads; CPU or CUDA selected by --no_cuda.
+    """
+    from PIL import Image
+    from types import SimpleNamespace
+    from datasets.mono_dataset import MonoDataset
+    from torch.utils.data._utils.collate import default_collate
+    import copy
+    torch.set_num_threads(2)
+    device = torch.device('cpu' if opt.no_cuda else 'cuda')
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA unavailable; use --no_cuda for CPU tests')
+    h, w, batch = 64, 128, 2
+    test_opt = copy.deepcopy(opt)
+    test_opt.height, test_opt.width, test_opt.batch_size = h, w, batch
+    test_opt.scales, test_opt.frame_ids = [0], [0, -1, 1]
+    test_opt.pose_model_type, test_opt.pose_model_input = 'separate_resnet', 'pairs'
+    test_opt.predictive_mask = test_opt.v1_multiscale = test_opt.use_stereo = False
+    test_opt.no_ssim = test_opt.disable_automasking = test_opt.avg_reprojection = False
+    test_opt.ra_views, test_opt.ra_depth = 'both', True
+    test_opt.ra_high_range, test_opt.ra_low_range = [1.1, 2.0], [0.7, 0.9]
+    test_opt.ra_consistency_weight, test_opt.ra_photo_weight, test_opt.ra_warmup_epochs = .1, 1., 5
+
+    class Synthetic(MonoDataset):
+        def __init__(self, ra_options):
+            super().__init__('', ['synthetic 1 l'] * batch, h, w, [0, -1, 1], 4,
+                             is_train=True, ra_options=ra_options)
+            self.K = np.array([[.58, 0, .5, 0], [0, 1.92, .5, 0],
+                               [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
+        def check_depth(self): return False
+        def get_color(self, folder, frame_index, side, do_flip):
+            rng = np.random.default_rng(7)
+            a = rng.integers(0, 256, (h*2, w*2, 3), dtype=np.uint8)
+            a = np.roll(a, frame_index - 1, axis=1)
+            im = Image.fromarray(a)
+            return im.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if do_flip else im
+
+    data = Synthetic(test_opt)
+    inputs = default_collate([data[i] for i in range(batch)])
+    for branch in ['high', 'low']:
+        assert inputs[('ra_color', branch, 0)].shape == (batch, 3, h, w)
+    base_data = Synthetic(None)
+    assert not any(isinstance(k, tuple) and k[0].startswith('ra_') for k in base_data[0])
+    print('PASS dataset: native resize/crop/stitch, fixed canvas; off has no RA tensors')
+
+    mid = torch.rand(batch, 1, h, w, device=device, requires_grad=True)
+    for branch in ['high', 'low']:
+        meta = inputs[('ra_meta', branch)].to(device)
+        view = torch.zeros_like(mid)
+        for i in range(batch):
+            rh, rw, dy, dx = meta[i].tolist()
+            resized = F.interpolate(mid[i:i+1], (rh, rw), mode='bilinear', align_corners=False)
+            if branch == 'high': view[i:i+1] = resized[:, :, dy:dy+h, dx:dx+w]
+            else: view[i:i+1, :, :rh, :rw] = resized
+        assert ra_consistency_loss(mid, view, meta, branch).abs() < 1e-7
+        # Perturbing stitched context must not enter the consistency supervision.
+        if branch == 'low':
+            for i in range(batch):
+                rh, rw = meta[i, :2].tolist()
+                view[i, :, rh:, :] = 100
+                view[i, :, :, rw:] = 100
+            assert ra_consistency_loss(mid, view, meta, branch).abs() < 1e-7
+        view = (view.detach() + .01).requires_grad_()
+        lc = ra_consistency_loss(mid, view, meta, branch, SSIM().to(device))
+        grads = torch.autograd.grad(lc, (mid, view), retain_graph=True)
+        assert all(torch.isfinite(g).all() and g.abs().sum() > 0 for g in grads)
+        assert ra_consistency_loss(mid, view, meta, branch, mid_mask=torch.zeros_like(mid)) == 0
+    print('PASS consistency: exact crop alignment, seam exclusion, zero mask, bilateral gradients')
+
+    K = inputs[('K', 0)].to(device)
+    meta = inputs[('ra_meta', 'high')].to(device)
+    Ka = ra_intrinsics(K, meta, h, w)
+    points = torch.tensor([.2, .1, 1, 1.], device=device).repeat(batch, 1)
+    px = (K @ points.unsqueeze(-1)).squeeze(-1)
+    actual = (Ka @ points.unsqueeze(-1)).squeeze(-1)
+    sx, sy = meta[:, 1] / w, meta[:, 0] / h
+    torch.testing.assert_close(actual[:, 0], (px[:, 0] + .5) * sx - .5 - meta[:, 3])
+    torch.testing.assert_close(actual[:, 1], (px[:, 1] + .5) * sy - .5 - meta[:, 2])
+    torch.testing.assert_close(Ka @ torch.linalg.inv(Ka), torch.eye(4, device=device).expand(batch, -1, -1), atol=1e-5, rtol=1e-5)
+    print('PASS intrinsics: pixel-center resize/crop and inverse projection')
+
+    t = Trainer.__new__(Trainer)
+    t.opt, t.device, t.epoch = test_opt, device, 0
+    t.num_scales, t.num_pose_frames, t.use_pose_net = 1, 2, True
+    t.models = {'encoder': networks.LiteMono(model=opt.model, height=h, width=w).to(device)}
+    t.models['depth'] = networks.DepthDecoder(t.models['encoder'].num_ch_enc, [0]).to(device)
+    t.models_pose = {'pose_encoder': networks.ResnetEncoder(18, False, 2).to(device)}
+    t.models_pose['pose'] = networks.PoseDecoder(t.models_pose['pose_encoder'].num_ch_enc, 1, 2).to(device)
+    t.ssim = SSIM().to(device)
+    t.backproject_depth = {0: BackprojectDepth(batch, h, w).to(device)}
+    t.project_3d = {0: Project3D(batch, h, w).to(device)}
+    calls = []
+    hook = t.models['encoder'].register_forward_hook(lambda *args: calls.append(1))
+    param_count = sum(p.numel() for m in t.models.values() for p in m.parameters())
+    for enabled, training, expected in [(False, True, 1), (True, True, 3), (True, False, 1)]:
+        t.opt.ra_depth = enabled
+        t.set_train() if training else t.set_eval()
+        assert all(m.training == training for m in t.models_pose.values())
+        calls.clear()
+        for m in list(t.models.values()) + list(t.models_pose.values()): m.zero_grad(set_to_none=True)
+        with torch.set_grad_enabled(training):
+            out, losses = t.process_batch(dict(inputs))
+            assert torch.isfinite(losses['loss'])
+            assert ('ra/consistency_high' in losses) == (enabled and training)
+            if training:
+                losses['loss'].backward()
+                for name, model in list(t.models.items()) + list(t.models_pose.items()):
+                    gs = [p.grad for p in model.parameters() if p.grad is not None]
+                    assert gs and all(torch.isfinite(g).all() for g in gs), name
+                    assert sum(float(g.abs().sum()) for g in gs) > 0, name
+        assert len(calls) == expected, calls
+        assert param_count == sum(p.numel() for m in t.models.values() for p in m.parameters())
+    hook.remove()
+    print('PASS process_batch: off=1 / on=3 / validation=1 depth forward; finite encoder/depth/pose gradients')
+    t.set_eval()
+    with torch.no_grad():
+        for ih, iw in [(128, 416), (192, 640), (320, 1024), (375, 1242)]:
+            x = torch.rand(1, 3, ih, iw, device=device)
+            x = F.pad(x, (0, (-iw) % 32, 0, (-ih) % 32), mode='replicate')
+            y = t.models['depth'](t.models['encoder'](x))[('disp', 0)][:, :, :ih, :iw]
+            assert y.shape == (1, 1, ih, iw) and torch.isfinite(y).all()
+            print('PASS variable resolution: {}x{}'.format(ih, iw))
+    print('PASS all synthetic checks; depth inference parameters:', param_count)
+    print('These checks do not establish KITTI accuracy or RTX 5090 performance.')

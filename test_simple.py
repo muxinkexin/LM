@@ -51,6 +51,8 @@ def parse_args():
                         help='if set, disables CUDA',
                         action='store_true')
 
+    parser.add_argument('--eval_height', type=int, default=None)
+    parser.add_argument('--eval_width', type=int, default=None)
     return parser.parse_args()
 
 
@@ -76,11 +78,17 @@ def test_simple(args):
     feed_height = encoder_dict['height']
     feed_width = encoder_dict['width']
 
+    if (args.eval_height is None) != (args.eval_width is None):
+        raise ValueError("set both eval_height and eval_width")
+    if args.eval_height is not None:
+        if min(args.eval_height, args.eval_width) < 64:
+            raise ValueError("evaluation dimensions must be >=64")
+        feed_height, feed_width = args.eval_height, args.eval_width
+
     # LOADING PRETRAINED MODEL
     print("   Loading pretrained encoder")
-    encoder = networks.LiteMono(model=args.model,
-                                    height=feed_height,
-                                    width=feed_width)
+    encoder = networks.LiteMono(model=encoder_dict.get('model', args.model),
+                                    height=encoder_dict['height'], width=encoder_dict['width'])
 
     model_dict = encoder.state_dict()
     encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
@@ -89,7 +97,10 @@ def test_simple(args):
     encoder.eval()
 
     print("   Loading pretrained decoder")
-    depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(3))
+    heads = sorted({int(k.split('.')[1]) - 6 for k in decoder_dict
+                    if k.startswith('decoder.') and k.endswith('.conv.weight')
+                    and int(k.split('.')[1]) >= 6})
+    depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=encoder_dict.get('scales', heads))
     depth_model_dict = depth_decoder.state_dict()
     depth_decoder.load_state_dict({k: v for k, v in decoder_dict.items() if k in depth_model_dict})
 
@@ -151,10 +162,12 @@ def test_simple(args):
 
             # PREDICTION
             input_image = input_image.to(device)
+            input_image = torch.nn.functional.pad(input_image,
+                (0, (-feed_width) % 32, 0, (-feed_height) % 32), mode='replicate')
             features = encoder(input_image)
             outputs = depth_decoder(features)
 
-            disp = outputs[("disp", 0)]
+            disp = outputs[("disp", 0)][:, :, :feed_height, :feed_width]
 
             disp_resized = torch.nn.functional.interpolate(
                 disp, (original_height, original_width), mode="bilinear", align_corners=False)
