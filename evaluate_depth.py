@@ -13,8 +13,9 @@ import time
 import json
 import hashlib
 import torch.nn.functional as F
-from thop import clever_format
-from thop import profile
+from pathlib import Path
+from depth_evaluation import (FullEvaluator, load_checkpoint, profile_depth, METRICS,
+    ROOT, atomic_json, read_files, check_validation_split)
 
 
 cv2.setNumThreads(0)  # This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
@@ -23,16 +24,10 @@ splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 
 
 def profile_once(encoder, decoder, x):
-    x_e = x[0, :, :, :].unsqueeze(0)
-    x_d = encoder(x_e)
-    flops_e, params_e = profile(encoder, inputs=(x_e, ), verbose=False)
-    flops_d, params_d = profile(decoder, inputs=(x_d, ), verbose=False)
-
-    flops, params = clever_format([flops_e + flops_d, params_e + params_d], "%.3f")
-    flops_e, params_e = clever_format([flops_e, params_e], "%.3f")
-    flops_d, params_d = clever_format([flops_d, params_d], "%.3f")
-
-    return flops, params, flops_e, params_e, flops_d, params_d
+    # Compatibility wrapper; values are estimates under the documented convention.
+    r = profile_depth(encoder, decoder, x.shape[-2], x.shape[-1], x.device)
+    return ("{:.3f}G".format(r['GFLOPs']), "{:.3f}M".format(r['Params_M']),
+            "see total", "see total", "see total", "see total")
 
 
 def time_sync():
@@ -74,11 +69,63 @@ def batch_post_process_disparity(l_disp, r_disp):
     return r_mask * l_disp + l_mask * r_disp + (1.0 - l_mask - r_mask) * m_disp
 
 
+def evaluate_shared(opt):
+    if not opt.load_weights_folder:
+        raise ValueError("--load_weights_folder is required")
+    device = torch.device('cpu' if opt.no_cuda else 'cuda')
+    torch.backends.cuda.matmul.allow_tf32 = opt.allow_tf32
+    torch.backends.cudnn.allow_tf32 = opt.allow_tf32
+    encoder, decoder, meta = load_checkpoint(opt.load_weights_folder, device, opt.model)
+    h, w = opt.eval_height or meta['height'], opt.eval_width or meta['width']
+    for name in ['min_depth','max_depth']:
+        if name in meta and abs(float(meta[name])-float(getattr(opt,name))) > 1e-12:
+            raise ValueError("checkpoint {} differs; pass the training depth bounds".format(name))
+    files = opt.eval_files or str(ROOT / (
+        'splits/eigen_zhou/val_files.txt' if opt.eval_role=='val' else 'splits/eigen/test_files.txt'))
+    gt = opt.eval_gt_path or (str(ROOT/'splits/eigen/gt_depths.npz') if opt.eval_role=='test' else None)
+    if gt is None:
+        raise ValueError("--eval_role val requires --eval_gt_path; do not reuse the 697 test GT")
+    if opt.eval_role=='val':
+        check_validation_split(read_files(files), read_files(ROOT/'splits'/opt.split/'train_files.txt'))
+    evaluator = FullEvaluator(opt.data_path, files, gt, [(h,w)], opt.png,
+        opt.eval_batch_size, opt.num_workers, device, opt.eval_role, opt.eval_crop,
+        not opt.disable_median_scaling, opt.pred_depth_scale_factor,
+        opt.min_depth, opt.max_depth, opt.post_process)
+    predictions = []
+    def save_prediction(height, width, index, disparity):
+        predictions.append(disparity)
+    row = evaluator.evaluate(encoder,decoder,profile=opt.profile,per_image=True,
+            prediction_callback=save_prediction if opt.save_pred_disps else None)[0]
+    result = {'metrics':{key:row[key] for key in METRICS},
+              'per_image_errors':row['per_image_errors'], 'input_hw':[h,w],
+              'weights':str(Path(opt.load_weights_folder).resolve()),
+              'post_process':opt.post_process,'median_scaling':not opt.disable_median_scaling,
+              'depth_scale_factor':opt.pred_depth_scale_factor,'split':opt.eval_split,
+              'role':opt.eval_role,'crop':opt.eval_crop,'num_images':row['num_images'],
+              'test_files_sha256':hashlib.sha256('\n'.join(read_files(files)).encode()).hexdigest(),
+              'protocol':evaluator.config,
+              'complexity':{key:row[key] for key in ['Params','MACs','FLOPs','GFLOPs','complexity_convention'] if key in row}}
+    if opt.metrics_json:
+        atomic_json(opt.metrics_json,result)
+    if opt.save_pred_disps:
+        out = Path(opt.eval_out_dir or opt.load_weights_folder)
+        out.mkdir(parents=True,exist_ok=True)
+        np.save(out/'disps_{}_{}x{}.npy'.format(opt.eval_role,h,w),np.asarray(predictions))
+    print("Metrics:", result['metrics'])
+    if opt.profile:
+        print("Complexity:", result['complexity'])
+    return result
+
+
 def evaluate(opt):
     """Evaluates a pretrained model using a specified test set
     """
     torch.backends.cuda.matmul.allow_tf32 = opt.allow_tf32
     torch.backends.cudnn.allow_tf32 = opt.allow_tf32
+    if opt.ext_disp_to_eval is None and not opt.no_eval:
+        return evaluate_shared(opt)
+    if opt.eval_role != 'test' or opt.eval_files or opt.eval_gt_path:
+        raise ValueError("legacy --ext_disp_to_eval/--no_eval supports default test data only")
     MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
 
@@ -281,8 +328,13 @@ def compare_metrics(directories):
         with open(left[name]) as f: b = json.load(f)
         with open(right[name]) as f: r = json.load(f)
         for key in ['input_hw', 'split', 'num_images', 'post_process', 'median_scaling',
-                    'depth_scale_factor', 'test_files_sha256']:
-            if key not in b or b[key] != r.get(key):
+                    'depth_scale_factor', 'test_files_sha256', 'role', 'crop']:
+            if key in ('role','crop'):
+                default = 'test' if key=='role' else 'garg'
+                same = b.get(key,default)==r.get(key,default)
+            else:
+                same = key in b and b[key]==r.get(key)
+            if not same:
                 raise ValueError("protocol mismatch or missing {} in {}".format(key, name))
         be, re = np.asarray(b['per_image_errors']), np.asarray(r['per_image_errors'])
         if be.shape != re.shape or be.shape != (b['num_images'], 7):

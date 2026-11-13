@@ -230,6 +230,12 @@ class LiteMonoOptions:
         self.parser.add_argument("--eval_height", type=int, default=None)
         self.parser.add_argument("--eval_width", type=int, default=None)
         self.parser.add_argument("--eval_batch_size", type=int, default=4)
+        self.parser.add_argument("--eval_files", type=str, default=None,
+                                 help="image list for full depth evaluation")
+        self.parser.add_argument("--eval_gt_path", type=str, default=None,
+                                 help="matching GT NPZ/cache for full depth evaluation")
+        self.parser.add_argument("--eval_role", choices=["val", "test"], default="test")
+        self.parser.add_argument("--eval_crop", choices=["garg", "none"], default="garg")
         self.parser.add_argument("--metrics_json", type=str, default=None)
         self.parser.add_argument("--compare_metrics", nargs=2, metavar=("BASE_DIR", "RA_DIR"),
                                  help="compare paired per-resolution evaluation JSON files")
@@ -244,6 +250,8 @@ class LiteMonoOptions:
             self.parser.error("set both --eval_height and --eval_width")
         if o.eval_height is not None and min(o.eval_height, o.eval_width) < 64:
             self.parser.error("evaluation dimensions must be >=64")
+        if o.eval_role == "val" and not o.eval_gt_path:
+            self.parser.error("--eval_role val requires --eval_gt_path")
         if len(o.lr) != 6 or min(o.lr[2], o.lr[5]) < 1:
             self.parser.error("--lr requires six numbers; cycle lengths must be positive")
         if not o.scales or 0 not in o.scales or any(v not in [0, 1, 2] for v in o.scales):

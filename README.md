@@ -272,6 +272,31 @@ tiny 实验把 RUN 替换为 `tiny_base_s42 tiny_ra_s42`，命令中的 model �
 
 跨尺度一致性变小只能证明优化目标被学习，不能排除平滑/常数预测。完整 GT 指标与多分辨率退化对照才是判断依据。当前交付没有填写任何 KITTI 精度提升数字。
 
+### 6.3 批量评估所有 checkpoint 与断点续跑
+
+`evaluate_all_weights.py` 按 epoch 顺序扫描 `weights_*`，默认在 Eigen test 的全部 697 张图上评估，结果保存为 `all_weights.csv` 和逐 checkpoint JSON。每完成一个分辨率就更新 `.partial.json` 与 CSV；`--resume` 会检查权重指纹、图像列表、GT 和评估配置，再复用完整 checkpoint 或已完成的分辨率。
+
+本机实际 Conda 环境名为小写 `litemono`。以下命令对应现有 baseline 的六分辨率评估，RGB 为 JPG，因此不加 `--png`：
+
+```bash
+conda activate litemono
+cd /home/tzq/tzq/3/Lite-Mono
+env -u LD_LIBRARY_PATH -u LD_PRELOAD \
+  CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+  python evaluate_all_weights.py \
+  --data_path /home/zy/KITTI \
+  --weights_root /home/tzq/tzq/3/checkpoint/LM_runs/baseline_s42/models \
+  --role test \
+  --resolutions 128x416 192x640 256x832 320x1024 384x1280 375x1242 \
+  --eval_batch_size 4 --num_workers 0 \
+  --output_dir /home/tzq/tzq/3/checkpoint/LM_results/baseline_all_s42 \
+  --resume --reuse_compatible_results --diagnostics --forward_retries 1
+```
+
+`--reuse_compatible_results` 仅允许代码中明确列出的旧评估引擎 SHA-256，且其他配置必须完全相同。路径复用修复之前的 `fc0d9b0...` 引擎已列入兼容清单；本次修复只改变路径构造和复用，不改变图像预处理、模型推理、指标或计算量统计。未知引擎或评估配置有变化时，使用新的输出目录。
+
+针对运行到 `weights_25` 的 `375×1242` 时出现的 `unsupported operand type(s) for /: 'PosixPath' and 'str'`：评估器现在只在启动时构造并检查图像路径，所有分辨率和 checkpoint 复用同一组路径。单条路径使用 `Path(root, folder, camera, 'data', filename)` 构造。`Path / str` 本身是合法操作；现有 traceback 不足以确定偶发异常的底层原因。`--forward_retries` 只处理前向中的 `NoneType` 调用异常，不处理这类数据集初始化错误。
+
 ## 7. 开关、消融与加载已有权重
 
 | 目的 | 参数 |
